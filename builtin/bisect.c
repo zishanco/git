@@ -9,6 +9,7 @@
 #include "prompt.h"
 #include "quote.h"
 #include "revision.h"
+#include "config.h"
 
 static GIT_PATH_FUNC(git_path_bisect_terms, "BISECT_TERMS")
 static GIT_PATH_FUNC(git_path_bisect_expected_rev, "BISECT_EXPECTED_REV")
@@ -1457,6 +1458,7 @@ int cmd_bisect(int argc, const char **argv, const char *prefix)
 		OPT_END()
 	};
 
+	git_config(git_default_config, NULL);
 	argc = parse_options(argc, argv, prefix, options,
 			     bisect_usage, PARSE_OPT_SUBCOMMAND_OPTIONAL);
 
