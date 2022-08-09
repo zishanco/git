@@ -1,8 +1,33 @@
 #include "cache.h"
+#include "cache-tree.h"
 #include "dir.h"
 #include "entry.h"
+#include "lockfile.h"
 #include "merge-strategies.h"
+#include "unpack-trees.h"
 #include "xdiff-interface.h"
+
+static int check_index_is_head(struct repository *r, const char *head_arg)
+{
+	struct commit *head_commit;
+	struct tree *head_tree;
+	struct object_id head;
+	struct strbuf sb = STRBUF_INIT;
+
+	get_oid(head_arg, &head);
+	head_commit = lookup_commit_reference(r, &head);
+	head_tree = repo_get_commit_tree(r, head_commit);
+
+	if (repo_index_has_changes(r, head_tree, &sb)) {
+		error(_("Your local changes to the following files "
+			"would be overwritten by merge:\n  %s"),
+		      sb.buf);
+		strbuf_release(&sb);
+		return 1;
+	}
+
+	return 0;
+}
 
 static int add_merge_result_to_index(struct index_state *istate, unsigned int mode,
 				     const struct object_id *oid, const char *path,
@@ -279,4 +304,116 @@ int merge_all_index(struct index_state *istate, int oneshot, int quiet,
 	if (err && !quiet)
 		error(_("merge program failed"));
 	return err;
+}
+
+static int merge_trees(struct repository *r, struct tree_desc *t,
+		       int nr, int aggressive)
+{
+	struct unpack_trees_options opts;
+
+	refresh_index(r->index, REFRESH_QUIET, NULL, NULL, NULL);
+
+	memset(&opts, 0, sizeof(opts));
+	opts.head_idx = 1;
+	opts.src_index = r->index;
+	opts.dst_index = r->index;
+	opts.merge = 1;
+	opts.update = 1;
+	opts.aggressive = aggressive;
+
+	if (nr == 1)
+		opts.fn = oneway_merge;
+	else if (nr == 2) {
+		opts.fn = twoway_merge;
+		opts.initial_checkout = is_index_unborn(r->index);
+	} else if (nr >= 3) {
+		opts.fn = threeway_merge;
+		opts.head_idx = nr - 1;
+	}
+
+	if (unpack_trees(nr, t, &opts))
+		return -1;
+	return 0;
+}
+
+static int add_tree(struct tree *tree, struct tree_desc *t)
+{
+	if (parse_tree(tree))
+		return -1;
+
+	init_tree_desc(t, tree->buffer, tree->size);
+	return 0;
+}
+
+static int write_tree(struct repository *r)
+{
+	int was_valid;
+	was_valid = r->index->cache_tree &&
+		cache_tree_fully_valid(r->index->cache_tree);
+
+	if (!was_valid && cache_tree_update(r->index, WRITE_TREE_SILENT) < 0)
+		return WRITE_TREE_UNMERGED_INDEX;
+	return 0;
+}
+
+int merge_strategies_resolve(struct repository *r,
+			     struct commit_list *bases, const char *head_arg,
+			     struct commit_list *remote)
+{
+	struct tree_desc t[MAX_UNPACK_TREES];
+	struct commit_list *i;
+	struct lock_file lock = LOCK_INIT;
+	int nr = 0, ret = 0;
+
+	/* Abort if index does not match head */
+	if (check_index_is_head(r, head_arg))
+		return 2;
+
+	/*
+	 * Give up if we are given two or more remotes.  Not handling
+	 * octopus.
+	 */
+	if (remote && remote->next)
+		return 2;
+
+	/* Give up if this is a baseless merge. */
+	if (!bases)
+		return 2;
+
+	puts(_("Trying simple merge."));
+
+	for (i = bases; i && i->item; i = i->next) {
+		if (add_tree(repo_get_commit_tree(r, i->item), t + (nr++)))
+			return 2;
+	}
+
+	if (head_arg) {
+		struct object_id head;
+		struct tree *tree;
+
+		get_oid(head_arg, &head);
+		tree = parse_tree_indirect(&head);
+
+		if (add_tree(tree, t + (nr++)))
+			return 2;
+	}
+
+	if (remote && add_tree(repo_get_commit_tree(r, remote->item), t + (nr++)))
+		return 2;
+
+	repo_hold_locked_index(r, &lock, LOCK_DIE_ON_ERROR);
+
+	if (merge_trees(r, t, nr, 1)) {
+		rollback_lock_file(&lock);
+		return 2;
+	}
+
+	if (write_tree(r)) {
+		puts(_("Simple merge failed, trying Automatic merge."));
+		ret = merge_all_index(r->index, 1, 0, merge_one_file_func, NULL);
+	}
+
+	if (write_locked_index(r->index, &lock, COMMIT_LOCK))
+		return !!error(_("unable to write new index file"));
+	return !!ret;
 }
