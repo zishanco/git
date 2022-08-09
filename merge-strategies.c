@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "cache-tree.h"
+#include "commit-reach.h"
 #include "dir.h"
 #include "entry.h"
 #include "lockfile.h"
@@ -416,4 +417,174 @@ int merge_strategies_resolve(struct repository *r,
 	if (write_locked_index(r->index, &lock, COMMIT_LOCK))
 		return !!error(_("unable to write new index file"));
 	return !!ret;
+}
+
+static int octopus_fast_forward(struct repository *r, const char *branch_name,
+				struct tree *tree_head, struct tree *current_tree)
+{
+	/*
+	 * The first head being merged was a fast-forward.  Advance the
+	 * reference commit to the head being merged, and use that tree
+	 * as the intermediate result of the merge.  We still need to
+	 * count this as part of the parent set.
+	 */
+	struct tree_desc t[2];
+
+	printf(_("Fast-forwarding to: %s\n"), branch_name);
+
+	init_tree_desc(t, tree_head->buffer, tree_head->size);
+	if (add_tree(current_tree, t + 1))
+		return -1;
+	if (merge_trees(r, t, 2, 0))
+		return -1;
+	if (write_tree(r))
+		return -1;
+
+	return 0;
+}
+
+static int octopus_do_merge(struct repository *r, const char *branch_name,
+			    struct commit_list *common, struct tree *current_tree,
+			    struct tree *reference_tree)
+{
+	struct tree_desc t[MAX_UNPACK_TREES];
+	struct commit_list *i;
+	int nr = 0, ret = 0;
+
+	printf(_("Trying simple merge with %s\n"), branch_name);
+
+	for (i = common; i; i = i->next) {
+		struct tree *tree = repo_get_commit_tree(r, i->item);
+		if (add_tree(tree, t + (nr++)))
+			return -1;
+	}
+
+	if (add_tree(reference_tree, t + (nr++)))
+		return -1;
+	if (add_tree(current_tree, t + (nr++)))
+		return -1;
+	if (merge_trees(r, t, nr, 1))
+		return 2;
+
+	if (write_tree(r)) {
+		puts(_("Simple merge did not work, trying automatic merge."));
+		ret = !!merge_all_index(r->index, 1, 0, merge_one_file_func, NULL);
+		write_tree(r);
+	}
+
+	return ret;
+}
+
+int merge_strategies_octopus(struct repository *r,
+			     struct commit_list *bases, const char *head_arg,
+			     struct commit_list *remotes)
+{
+	int ff_merge = 1, ret = 0, nr_references = 1;
+	struct commit **reference_commits, *head_commit;
+	struct tree *reference_tree, *head_tree;
+	struct commit_list *i;
+	struct object_id head;
+	struct lock_file lock = LOCK_INIT;
+
+	/*
+	 * Reject if this is not an octopus -- resolve should be used
+	 * instead.
+	 */
+	if (commit_list_count(remotes) < 2)
+		return 2;
+
+	/* Abort if index does not match head */
+	if (check_index_is_head(r, head_arg))
+		return 2;
+
+	get_oid(head_arg, &head);
+	head_commit = lookup_commit_reference(r, &head);
+	head_tree = repo_get_commit_tree(r, head_commit);
+
+	CALLOC_ARRAY(reference_commits, commit_list_count(remotes) + 1);
+	reference_commits[0] = head_commit;
+	reference_tree = head_tree;
+
+	repo_hold_locked_index(r, &lock, LOCK_DIE_ON_ERROR);
+
+	for (i = remotes; i && i->item; i = i->next) {
+		struct commit *c = i->item;
+		struct object_id *oid = &c->object.oid;
+		struct tree *current_tree = repo_get_commit_tree(r, c);
+		struct commit_list *common, *j;
+		char *branch_name = merge_get_better_branch_name(oid_to_hex(oid));
+		int up_to_date = 0;
+
+		common = repo_get_merge_bases_many(r, c, nr_references, reference_commits);
+		if (!common) {
+			error(_("Unable to find common commit with %s"), branch_name);
+
+			free(branch_name);
+			free_commit_list(common);
+
+			ret = 2;
+			break;
+		}
+
+		/*
+		 * If `oid' is reachable from `HEAD', we're already up
+		 * to date.
+		 */
+		for (j = common; j; j = j->next) {
+			if (oideq(&j->item->object.oid, oid)) {
+				up_to_date = 1;
+				break;
+			}
+		}
+
+		if (up_to_date) {
+			printf(_("Already up to date with %s\n"), branch_name);
+
+			free(branch_name);
+			free_commit_list(common);
+			continue;
+		}
+
+		/*
+		 * If we could fast-forward so far and `HEAD' is the
+		 * single merge base with the current `remote' revision,
+		 * keep fast-forwarding.
+		 */
+		if (ff_merge && common && !common->next && nr_references == 1 &&
+		    oideq(&common->item->object.oid,
+			  &reference_commits[0]->object.oid)) {
+			ret = octopus_fast_forward(r, branch_name, head_tree, current_tree);
+			nr_references = 0;
+		} else {
+			ret = octopus_do_merge(r, branch_name, common,
+					       current_tree, reference_tree);
+			ff_merge = 0;
+		}
+
+		free(branch_name);
+		free_commit_list(common);
+
+		if (ret == -1 || ret == 2)
+			break;
+		else if (ret && i->next) {
+			/*
+			 * We allow only last one to have a
+			 * hand-resolvable conflicts.  Last round failed
+			 * and we still had a head to merge.
+			 */
+			puts(_("Automated merge did not work."));
+			puts(_("Should not be doing an octopus."));
+
+			ret = 2;
+			break;
+		}
+
+		reference_commits[nr_references++] = c;
+		reference_tree = lookup_tree(r, &r->index->cache_tree->oid);
+	}
+
+	free(reference_commits);
+	write_locked_index(r->index, &lock, COMMIT_LOCK);
+
+	return ret;
 }
