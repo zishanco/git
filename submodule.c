@@ -2374,7 +2374,7 @@ void absorb_git_dir_into_superproject(const char *path,
 		cp.no_stdin = 1;
 		strvec_pushl(&cp.args, "--super-prefix", sb.buf,
 			     "submodule--helper",
-			     "absorb-git-dirs", NULL);
+			     "absorbgitdirs", NULL);
 		prepare_submodule_repo_env(&cp.env);
 		if (run_command(&cp))
 			die(_("could not recurse into submodule '%s'"), path);
@@ -2388,7 +2388,7 @@ int get_superproject_working_tree(struct strbuf *buf)
 	struct child_process cp = CHILD_PROCESS_INIT;
 	struct strbuf sb = STRBUF_INIT;
 	struct strbuf one_up = STRBUF_INIT;
-	const char *cwd = xgetcwd();
+	char *cwd = xgetcwd();
 	int ret = 0;
 	const char *subpath;
 	int code;
@@ -2451,6 +2451,7 @@ int get_superproject_working_tree(struct strbuf *buf)
 		ret = 1;
 		free(super_wt);
 	}
+	free(cwd);
 	strbuf_release(&sb);
 
 	code = finish_command(&cp);

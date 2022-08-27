@@ -118,10 +118,11 @@ static int resolve_relative_url_test(int argc, const char **argv, const char *pr
 	return 0;
 }
 
-static char *do_get_submodule_displaypath(const char *path,
-					  const char *prefix,
-					  const char *super_prefix)
+/* the result should be freed by the caller. */
+static char *get_submodule_displaypath(const char *path, const char *prefix)
 {
+	const char *super_prefix = get_super_prefix();
+
 	if (prefix && super_prefix) {
 		BUG("cannot have prefix '%s' and superprefix '%s'",
 		    prefix, super_prefix);
@@ -135,13 +136,6 @@ static char *do_get_submodule_displaypath(const char *path,
 	} else {
 		return xstrdup(path);
 	}
-}
-
-/* the result should be freed by the caller. */
-static char *get_submodule_displaypath(const char *path, const char *prefix)
-{
-	const char *super_prefix = get_super_prefix();
-	return do_get_submodule_displaypath(path, prefix, super_prefix);
 }
 
 static char *compute_rev_name(const char *sub_path, const char* object_id)
@@ -444,7 +438,7 @@ static int module_foreach(int argc, const char **argv, const char *prefix)
 	};
 
 	const char *const git_submodule_helper_usage[] = {
-		N_("git submodule--helper foreach [--quiet] [--recursive] [--] <command>"),
+		N_("git submodule foreach [--quiet] [--recursive] [--] <command>"),
 		NULL
 	};
 
@@ -477,22 +471,18 @@ static int starts_with_dot_dot_slash(const char *const path)
 
 struct init_cb {
 	const char *prefix;
-	const char *superprefix;
 	unsigned int flags;
 };
 #define INIT_CB_INIT { 0 }
 
 static void init_submodule(const char *path, const char *prefix,
-			   const char *superprefix, unsigned int flags)
+			   unsigned int flags)
 {
 	const struct submodule *sub;
 	struct strbuf sb = STRBUF_INIT;
 	char *upd = NULL, *url = NULL, *displaypath;
 
-	/* try superprefix from the environment, if it is not passed explicitly */
-	if (!superprefix)
-		superprefix = get_super_prefix();
-	displaypath = do_get_submodule_displaypath(path, prefix, superprefix);
+	displaypath = get_submodule_displaypath(path, prefix);
 
 	sub = submodule_from_path(the_repository, null_oid(), path);
 
@@ -566,7 +556,7 @@ static void init_submodule(const char *path, const char *prefix,
 static void init_submodule_cb(const struct cache_entry *list_item, void *cb_data)
 {
 	struct init_cb *info = cb_data;
-	init_submodule(list_item->name, info->prefix, info->superprefix, info->flags);
+	init_submodule(list_item->name, info->prefix, info->flags);
 }
 
 static int module_init(int argc, const char **argv, const char *prefix)
@@ -582,7 +572,7 @@ static int module_init(int argc, const char **argv, const char *prefix)
 	};
 
 	const char *const git_submodule_helper_usage[] = {
-		N_("git submodule--helper init [<options>] [<path>]"),
+		N_("git submodule init [<options>] [<path>]"),
 		NULL
 	};
 
@@ -1185,7 +1175,7 @@ static int module_summary(int argc, const char **argv, const char *prefix)
 	};
 
 	const char *const git_submodule_helper_usage[] = {
-		N_("git submodule--helper summary [<options>] [<commit>] [--] [<path>]"),
+		N_("git submodule summary [<options>] [<commit>] [--] [<path>]"),
 		NULL
 	};
 
@@ -1349,7 +1339,7 @@ static int module_sync(int argc, const char **argv, const char *prefix)
 	};
 
 	const char *const git_submodule_helper_usage[] = {
-		N_("git submodule--helper sync [--quiet] [--recursive] [<path>]"),
+		N_("git submodule sync [--quiet] [--recursive] [<path>]"),
 		NULL
 	};
 
@@ -1818,7 +1808,7 @@ static int module_clone(int argc, const char **argv, const char *prefix)
 static void determine_submodule_update_strategy(struct repository *r,
 						int just_cloned,
 						const char *path,
-						const char *update,
+						enum submodule_update_type update,
 						struct submodule_update_strategy *out)
 {
 	const struct submodule *sub = submodule_from_path(r, null_oid(), path);
@@ -1828,9 +1818,7 @@ static void determine_submodule_update_strategy(struct repository *r,
 	key = xstrfmt("submodule.%s.update", sub->name);
 
 	if (update) {
-		if (parse_submodule_update_strategy(update, out) < 0)
-			die(_("Invalid update mode '%s' for submodule path '%s'"),
-				update, path);
+		out->type = update;
 	} else if (!repo_config_get_string_tmp(r, key, &val)) {
 		if (parse_submodule_update_strategy(val, out) < 0)
 			die(_("Invalid update mode '%s' configured for submodule path '%s'"),
@@ -1880,9 +1868,8 @@ struct submodule_update_clone {
 
 struct update_data {
 	const char *prefix;
-	const char *recursive_prefix;
 	const char *displaypath;
-	const char *update_default;
+	enum submodule_update_type update_default;
 	struct object_id suboid;
 	struct string_list references;
 	struct submodule_update_strategy update_strategy;
@@ -1949,29 +1936,19 @@ static int prepare_to_clone_next_submodule(const struct cache_entry *ce,
 	const char *update_string;
 	enum submodule_update_type update_type;
 	char *key;
-	struct strbuf displaypath_sb = STRBUF_INIT;
+	struct update_data *ud = suc->update_data;
+	char *displaypath = get_submodule_displaypath(ce->name, ud->prefix);
 	struct strbuf sb = STRBUF_INIT;
-	const char *displaypath = NULL;
 	int needs_cloning = 0;
 	int need_free_url = 0;
 
 	if (ce_stage(ce)) {
-		if (suc->update_data->recursive_prefix)
-			strbuf_addf(&sb, "%s/%s", suc->update_data->recursive_prefix, ce->name);
-		else
-			strbuf_addstr(&sb, ce->name);
-		strbuf_addf(out, _("Skipping unmerged submodule %s"), sb.buf);
+		strbuf_addf(out, _("Skipping unmerged submodule %s"), displaypath);
 		strbuf_addch(out, '\n');
 		goto cleanup;
 	}
 
 	sub = submodule_from_path(the_repository, null_oid(), ce->name);
-
-	if (suc->update_data->recursive_prefix)
-		displaypath = relative_path(suc->update_data->recursive_prefix,
-					    ce->name, &displaypath_sb);
-	else
-		displaypath = ce->name;
 
 	if (!sub) {
 		next_submodule_warn_missing(suc, out, displaypath);
@@ -2062,7 +2039,7 @@ static int prepare_to_clone_next_submodule(const struct cache_entry *ce,
 					      "--no-single-branch");
 
 cleanup:
-	strbuf_release(&displaypath_sb);
+	free(displaypath);
 	strbuf_release(&sb);
 	if (need_free_url)
 		free((void*)url);
@@ -2405,13 +2382,33 @@ static void ensure_core_worktree(const char *path)
 	}
 }
 
+static const char *submodule_update_type_to_label(enum submodule_update_type type)
+{
+	switch (type) {
+	case SM_UPDATE_CHECKOUT:
+		return "checkout";
+	case SM_UPDATE_MERGE:
+		return "merge";
+	case SM_UPDATE_REBASE:
+		return "rebase";
+	case SM_UPDATE_UNSPECIFIED:
+	case SM_UPDATE_NONE:
+	case SM_UPDATE_COMMAND:
+		break;
+	}
+	BUG("unreachable with type %d", type);
+}
+
 static void update_data_to_args(struct update_data *update_data, struct strvec *args)
 {
+	enum submodule_update_type update_type = update_data->update_default;
+
+	if (update_data->displaypath) {
+		strvec_push(args, "--super-prefix");
+		strvec_pushf(args, "%s/", update_data->displaypath);
+	}
 	strvec_pushl(args, "submodule--helper", "update", "--recursive", NULL);
 	strvec_pushf(args, "--jobs=%d", update_data->max_jobs);
-	if (update_data->recursive_prefix)
-		strvec_pushl(args, "--recursive-prefix",
-			     update_data->recursive_prefix, NULL);
 	if (update_data->quiet)
 		strvec_push(args, "--quiet");
 	if (update_data->force)
@@ -2430,8 +2427,10 @@ static void update_data_to_args(struct update_data *update_data, struct strvec *
 		strvec_push(args, "--require-init");
 	if (update_data->depth)
 		strvec_pushf(args, "--depth=%d", update_data->depth);
-	if (update_data->update_default)
-		strvec_pushl(args, "--update", update_data->update_default, NULL);
+	if (update_type != SM_UPDATE_UNSPECIFIED)
+		strvec_pushf(args, "--%s",
+			     submodule_update_type_to_label(update_type));
+
 	if (update_data->references.nr) {
 		struct string_list_item *item;
 		for_each_string_list_item(item, &update_data->references)
@@ -2453,19 +2452,10 @@ static void update_data_to_args(struct update_data *update_data, struct strvec *
 
 static int update_submodule(struct update_data *update_data)
 {
-	char *prefixed_path;
-
 	ensure_core_worktree(update_data->sm_path);
 
-	if (update_data->recursive_prefix)
-		prefixed_path = xstrfmt("%s%s", update_data->recursive_prefix,
-					update_data->sm_path);
-	else
-		prefixed_path = xstrdup(update_data->sm_path);
-
-	update_data->displaypath = get_submodule_displaypath(prefixed_path,
-							     update_data->prefix);
-	free(prefixed_path);
+	update_data->displaypath = get_submodule_displaypath(
+		update_data->sm_path, update_data->prefix);
 
 	determine_submodule_update_strategy(the_repository, update_data->just_cloned,
 					    update_data->sm_path, update_data->update_default,
@@ -2505,14 +2495,6 @@ static int update_submodule(struct update_data *update_data)
 		struct update_data next = *update_data;
 		int res;
 
-		if (update_data->recursive_prefix)
-			prefixed_path = xstrfmt("%s%s/", update_data->recursive_prefix,
-						update_data->sm_path);
-		else
-			prefixed_path = xstrfmt("%s/", update_data->sm_path);
-
-		next.recursive_prefix = get_submodule_displaypath(prefixed_path,
-								  update_data->prefix);
 		next.prefix = NULL;
 		oidcpy(&next.oid, null_oid());
 		oidcpy(&next.suboid, null_oid());
@@ -2597,13 +2579,15 @@ static int module_update(int argc, const char **argv, const char *prefix)
 		OPT_STRING(0, "prefix", &opt.prefix,
 			   N_("path"),
 			   N_("path into the working tree")),
-		OPT_STRING(0, "recursive-prefix", &opt.recursive_prefix,
-			   N_("path"),
-			   N_("path into the working tree, across nested "
-			      "submodule boundaries")),
-		OPT_STRING(0, "update", &opt.update_default,
-			   N_("string"),
-			   N_("rebase, merge, checkout or none")),
+		OPT_SET_INT(0, "checkout", &opt.update_default,
+			N_("use the 'checkout' update strategy (default)"),
+			SM_UPDATE_CHECKOUT),
+		OPT_SET_INT('m', "merge", &opt.update_default,
+			N_("use the 'merge' update strategy"),
+			SM_UPDATE_MERGE),
+		OPT_SET_INT('r', "rebase", &opt.update_default,
+			N_("use the 'rebase' update strategy"),
+			SM_UPDATE_REBASE),
 		OPT_STRING_LIST(0, "reference", &opt.references, N_("repo"),
 			   N_("reference repository")),
 		OPT_BOOL(0, "dissociate", &opt.dissociate,
@@ -2619,7 +2603,7 @@ static int module_update(int argc, const char **argv, const char *prefix)
 		OPT_BOOL(0, "progress", &opt.progress,
 			    N_("force cloning progress")),
 		OPT_BOOL(0, "require-init", &opt.require_init,
-			   N_("disallow cloning into non-empty directory")),
+			   N_("disallow cloning into non-empty directory, implies --init")),
 		OPT_BOOL(0, "single-branch", &opt.single_branch,
 			 N_("clone only one branch, HEAD or --branch")),
 		OPT_PARSE_LIST_OBJECTS_FILTER(&filter_options),
@@ -2643,6 +2627,9 @@ static int module_update(int argc, const char **argv, const char *prefix)
 	argc = parse_options(argc, argv, prefix, module_update_options,
 			     git_submodule_helper_usage, 0);
 
+	if (opt.require_init)
+		opt.init = 1;
+
 	if (filter_options.choice && !opt.init) {
 		usage_with_options(git_submodule_helper_usage,
 				   module_update_options);
@@ -2651,9 +2638,7 @@ static int module_update(int argc, const char **argv, const char *prefix)
 	opt.filter_options = &filter_options;
 
 	if (opt.update_default)
-		if (parse_submodule_update_strategy(opt.update_default,
-						    &opt.update_strategy) < 0)
-			die(_("bad value for update parameter"));
+		opt.update_strategy.type = opt.update_default;
 
 	if (module_list_compute(argc, argv, prefix, &pathspec, &opt.list) < 0) {
 		list_objects_filter_release(&filter_options);
@@ -2679,7 +2664,6 @@ static int module_update(int argc, const char **argv, const char *prefix)
 			module_list_active(&list);
 
 		info.prefix = opt.prefix;
-		info.superprefix = opt.recursive_prefix;
 		if (opt.quiet)
 			info.flags |= OPT_QUIET;
 
@@ -2785,7 +2769,7 @@ static int absorb_git_dirs(int argc, const char **argv, const char *prefix)
 	};
 
 	const char *const git_submodule_helper_usage[] = {
-		N_("git submodule--helper absorb-git-dirs [<options>] [<path>...]"),
+		N_("git submodule absorbgitdirs [<options>] [<path>...]"),
 		NULL
 	};
 
@@ -2890,7 +2874,7 @@ static int module_set_url(int argc, const char **argv, const char *prefix)
 		OPT_END()
 	};
 	const char *const usage[] = {
-		N_("git submodule--helper set-url [--quiet] <path> <newurl>"),
+		N_("git submodule set-url [--quiet] <path> <newurl>"),
 		NULL
 	};
 
@@ -2929,8 +2913,8 @@ static int module_set_branch(int argc, const char **argv, const char *prefix)
 		OPT_END()
 	};
 	const char *const usage[] = {
-		N_("git submodule--helper set-branch [-q|--quiet] (-d|--default) <path>"),
-		N_("git submodule--helper set-branch [-q|--quiet] (-b|--branch) <branch> <path>"),
+		N_("git submodule set-branch [-q|--quiet] (-d|--default) <path>"),
+		N_("git submodule set-branch [-q|--quiet] (-b|--branch) <branch> <path>"),
 		NULL
 	};
 
@@ -3274,7 +3258,7 @@ static int module_add(int argc, const char **argv, const char *prefix)
 	};
 
 	const char *const usage[] = {
-		N_("git submodule--helper add [<options>] [--] <repository> [<path>]"),
+		N_("git submodule add [<options>] [--] <repository> [<path>]"),
 		NULL
 	};
 
@@ -3376,18 +3360,18 @@ struct cmd_struct {
 static struct cmd_struct commands[] = {
 	{"list", module_list, 0},
 	{"name", module_name, 0},
-	{"clone", module_clone, 0},
-	{"add", module_add, SUPPORT_SUPER_PREFIX},
-	{"update", module_update, 0},
+	{"clone", module_clone, SUPPORT_SUPER_PREFIX},
+	{"add", module_add, 0},
+	{"update", module_update, SUPPORT_SUPER_PREFIX},
 	{"resolve-relative-url-test", resolve_relative_url_test, 0},
 	{"foreach", module_foreach, SUPPORT_SUPER_PREFIX},
-	{"init", module_init, SUPPORT_SUPER_PREFIX},
+	{"init", module_init, 0},
 	{"status", module_status, SUPPORT_SUPER_PREFIX},
 	{"sync", module_sync, SUPPORT_SUPER_PREFIX},
 	{"deinit", module_deinit, 0},
-	{"summary", module_summary, SUPPORT_SUPER_PREFIX},
+	{"summary", module_summary, 0},
 	{"push-check", push_check, 0},
-	{"absorb-git-dirs", absorb_git_dirs, SUPPORT_SUPER_PREFIX},
+	{"absorbgitdirs", absorb_git_dirs, SUPPORT_SUPER_PREFIX},
 	{"is-active", is_active, 0},
 	{"check-name", check_name, 0},
 	{"config", module_config, 0},
