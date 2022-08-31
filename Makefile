@@ -3170,14 +3170,20 @@ COCCI_TEST_RES = $(wildcard contrib/coccinelle/tests/*.res)
 	$(call mkdir_p_parent_template)
 	$(QUIET_GEN) >$@
 
+SPATCH_USE_O_DEPENDENCIES = yes
+ifeq ($(COMPUTE_HEADER_DEPENDENCIES),no)
+SPATCH_USE_O_DEPENDENCIES =
+endif
+
 define cocci-rule
 
 ## Rule for .build/$(1).patch/$(2); Params:
 # $(1) = e.g. "free.cocci"
 # $(2) = e.g. "grep.c"
+# $(3) = e.g. "grep.o"
 COCCI_$(1:contrib/coccinelle/%.cocci=%) += .build/$(1).patch/$(2)
 .build/$(1).patch/$(2): GIT-SPATCH-DEFINES
-.build/$(1).patch/$(2): .build/contrib/coccinelle/FOUND_H_SOURCES
+.build/$(1).patch/$(2): $(if $(and $(SPATCH_USE_O_DEPENDENCIES),$(wildcard $(3))),$(3),.build/contrib/coccinelle/FOUND_H_SOURCES)
 .build/$(1).patch/$(2): $(1)
 .build/$(1).patch/$(2): .build/$(1).patch/% : %
 	$$(call mkdir_p_parent_template)
@@ -3194,7 +3200,7 @@ endef
 
 define cocci-matrix-2
 
-$(foreach s,$(COCCI_SOURCES),$(call cocci-rule,$(c),$(s)))
+$(foreach s,$(COCCI_SOURCES),$(call cocci-rule,$(c),$(s),$(s:%.c=%.o)))
 endef
 define cocci-matrix-1
 $(foreach c,$(COCCI),$(call cocci-matrix-2,$(c)))
