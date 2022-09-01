@@ -96,6 +96,8 @@ static pthread_cond_t cond_result;
 
 static int skip_first_line;
 
+static int grep_sparse = 0;
+
 static void add_work(struct grep_opt *opt, struct grep_source *gs)
 {
 	if (opt->binary != GREP_BINARY_TEXT)
@@ -520,18 +522,38 @@ static int grep_cache(struct grep_opt *opt,
 	if (repo_read_index(repo) < 0)
 		die(_("index file corrupt"));
 
-	/* TODO: audit for interaction with sparse-index. */
-	ensure_full_index(repo->index);
 	for (nr = 0; nr < repo->index->cache_nr; nr++) {
 		const struct cache_entry *ce = repo->index->cache[nr];
 
-		if (!cached && ce_skip_worktree(ce))
+		/*
+		 * Skip entries with SKIP_WORKTREE unless both --sparse and
+		 * --cached are given.
+		 */
+		if (!(grep_sparse && cached) && ce_skip_worktree(ce))
 			continue;
 
 		strbuf_setlen(&name, name_base_len);
 		strbuf_addstr(&name, ce->name);
+		if (S_ISSPARSEDIR(ce->ce_mode)) {
+			enum object_type type;
+			struct tree_desc tree;
+			void *data;
+			unsigned long size;
+			struct strbuf base = STRBUF_INIT;
 
-		if (S_ISREG(ce->ce_mode) &&
+			strbuf_addstr(&base, ce->name);
+
+			data = read_object_file(&ce->oid, &type, &size);
+			init_tree_desc(&tree, data, size);
+
+			/*
+			 * sneak in the ce_mode using check_attr parameter
+			 */
+			hit |= grep_tree(opt, pathspec, &tree, &base,
+					 base.len, ce->ce_mode);
+			strbuf_release(&base);
+			free(data);
+		} else if (S_ISREG(ce->ce_mode) &&
 		    match_pathspec(repo->index, pathspec, name.buf, name.len, 0, NULL,
 				   S_ISDIR(ce->ce_mode) ||
 				   S_ISGITLINK(ce->ce_mode))) {
@@ -591,7 +613,14 @@ static int grep_tree(struct grep_opt *opt, const struct pathspec *pathspec,
 		int te_len = tree_entry_len(&entry);
 
 		if (match != all_entries_interesting) {
-			strbuf_addstr(&name, base->buf + tn_len);
+			if (S_ISSPARSEDIR(check_attr)) {
+				// object is a sparse directory entry
+				strbuf_addbuf(&name, base);
+			} else {
+				// object is a commit or a root tree
+				strbuf_addstr(&name, base->buf + tn_len);
+			}
+
 			match = tree_entry_interesting(repo->index,
 						       &entry, &name,
 						       0, pathspec);
@@ -963,6 +992,8 @@ int cmd_grep(int argc, const char **argv, const char *prefix)
 			   PARSE_OPT_NOCOMPLETE),
 		OPT_INTEGER('m', "max-count", &opt.max_count,
 			N_("maximum number of results per file")),
+		OPT_BOOL(0, "sparse", &grep_sparse,
+			 N_("search the contents of files outside the sparse-checkout definition")),
 		OPT_END()
 	};
 	grep_prefix = prefix;
@@ -983,6 +1014,11 @@ int cmd_grep(int argc, const char **argv, const char *prefix)
 	argc = parse_options(argc, argv, prefix, options, grep_usage,
 			     PARSE_OPT_KEEP_DASHDASH |
 			     PARSE_OPT_STOP_AT_NON_OPTION);
+
+	if (the_repository->gitdir) {
+		prepare_repo_settings(the_repository);
+		the_repository->settings.command_requires_full_index = 0;
+	}
 
 	if (use_index && !startup_info->have_repository) {
 		int fallback = 0;
