@@ -5265,7 +5265,7 @@ struct labels_entry {
 	char label[FLEX_ARRAY];
 };
 
-static int labels_cmp(const void *UNUSED(fndata),
+static int labels_cmp(const void *fndata UNUSED,
 		      const struct hashmap_entry *eptr,
 		      const struct hashmap_entry *entry_or_key, const void *key)
 {
@@ -6143,7 +6143,7 @@ struct subject2item_entry {
 	char subject[FLEX_ARRAY];
 };
 
-static int subject2item_cmp(const void *UNUSED(fndata),
+static int subject2item_cmp(const void *fndata UNUSED,
 			    const struct hashmap_entry *eptr,
 			    const struct hashmap_entry *entry_or_key,
 			    const void *key)
